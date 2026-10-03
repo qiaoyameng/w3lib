@@ -21,6 +21,12 @@ w3lib Package
 .. automodule:: w3lib.http
     :members:
 
+:mod:`~w3lib.srcset` Module
+---------------------------
+
+.. automodule:: w3lib.srcset
+    :members:
+
 :mod:`~w3lib.url` Module
 ------------------------
 
