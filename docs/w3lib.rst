@@ -29,3 +29,9 @@ w3lib Package
 
     .. autoclass:: ParseDataURIResult
        :members:
+
+    .. autoclass:: StreamParseDataURIResult
+       :members:
+
+    .. autoclass:: DataURIError
+       :members:

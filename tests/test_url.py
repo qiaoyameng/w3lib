@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from inspect import isclass
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import (
@@ -41,6 +42,7 @@ from w3lib._url import (
     _urlunsplit,
 )
 from w3lib.url import (
+    DataURIError,
     _normalize_ipv6_host,
     _remove_dot_segments,
     add_http_if_no_scheme,
@@ -51,6 +53,7 @@ from w3lib.url import (
     file_uri_to_path,
     is_url,
     parse_data_uri,
+    parse_data_uri_stream,
     parse_qsl_to_bytes,
     parse_url,
     path_to_file_uri,
@@ -2275,6 +2278,153 @@ class TestDataURI:
         assert result.data == b"A brief note"
         result = parse_data_uri("DaTa:,A%20brief%20note")
         assert result.data == b"A brief note"
+
+    @pytest.mark.parametrize("chunk_size", range(1, 8))
+    def test_stream_matches_parse_for_percent_data(self, chunk_size):
+        uri = "data:text/plain;charset=utf-8,He%6C%6Co%20%77%6Frld"
+        expected = parse_data_uri(uri)
+        raw = uri.encode()
+        chunks = [
+            raw[index : index + chunk_size]
+            for index in range(0, len(raw), chunk_size)
+        ]
+        sink = BytesIO()
+
+        result = parse_data_uri_stream(chunks, sink)
+
+        assert result.media_type == expected.media_type
+        assert result.media_type_parameters == expected.media_type_parameters
+        assert result.bytes_written == len(expected.data)
+        assert sink.getvalue() == expected.data
+
+    def test_stream_scheme_may_span_chunks(self):
+        sink = BytesIO()
+
+        result = parse_data_uri_stream(
+            [b"d", b"a", b"t", b"a", b":text/plain,", b"abc"],
+            sink,
+        )
+
+        assert result.media_type == "text/plain"
+        assert result.bytes_written == 3
+        assert sink.getvalue() == b"abc"
+
+    @pytest.mark.parametrize("chunk_size", range(1, 8))
+    def test_stream_matches_parse_for_base64_data(self, chunk_size):
+        uri = (
+            "data:text/plain;base64,"
+            "SGVsb%20G8sIH%0A%20%20dvcm%20%20%20xk%20Lg%3D%0A%3D"
+        )
+        expected = parse_data_uri(uri)
+        raw = uri.encode()
+        chunks = [
+            raw[index : index + chunk_size]
+            for index in range(0, len(raw), chunk_size)
+        ]
+        sink = BytesIO()
+
+        result = parse_data_uri_stream(chunks, sink)
+
+        assert result.media_type == expected.media_type
+        assert result.media_type_parameters == expected.media_type_parameters
+        assert result.bytes_written == len(expected.data)
+        assert sink.getvalue() == expected.data
+
+    def test_stream_limit_uses_decoded_size(self):
+        sink = BytesIO()
+
+        with pytest.raises(DataURIError, match="maximum size") as exc_info:
+            parse_data_uri_stream(
+                [b"data:,%41%42%43"],
+                sink,
+                max_metadata_length=10,
+                max_data_size=2,
+            )
+
+        assert exc_info.value.bytes_written == 0
+        assert sink.getvalue() == b""
+
+    def test_stream_base64_limit_uses_decoded_size(self):
+        sink = BytesIO()
+
+        with pytest.raises(DataURIError, match="maximum size"):
+            parse_data_uri_stream(
+                [b"data:;base64,QUJD"],
+                sink,
+                max_metadata_length=10,
+                max_data_size=2,
+            )
+
+        assert sink.getvalue() == b""
+
+    def test_stream_metadata_limit(self):
+        sink = BytesIO()
+
+        with pytest.raises(DataURIError, match="metadata exceeds"):
+            parse_data_uri_stream([b"data:text/plain,abc"], sink, max_metadata_length=4)
+
+        assert sink.getvalue() == b""
+
+    def test_stream_write_failure_reports_existing_bytes(self):
+        class FailingSink:
+            def __init__(self):
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> int:
+                self.writes.append(data)
+                if len(self.writes) == 2:
+                    raise OSError("disk full")
+                return len(data)
+
+        sink = FailingSink()
+
+        chunks = [b"data:,", b"a", b"b", b"c", b"d", b"e", b"f"]
+        with pytest.raises(DataURIError, match="sink write failed") as exc_info:
+            parse_data_uri_stream(chunks, sink, max_data_size=10)
+
+        assert exc_info.value.bytes_written == 1
+
+    def test_stream_interrupted_before_comma(self):
+        sink = BytesIO()
+
+        with pytest.raises(DataURIError, match="invalid data URI") as exc_info:
+            parse_data_uri_stream([b"data:text/plain"], sink)
+
+        assert exc_info.value.bytes_written == 0
+        assert sink.getvalue() == b""
+
+    def test_stream_interrupted_after_data(self):
+        sink = BytesIO(b"existing:")
+        sink.seek(0, 2)
+
+        def interrupted_chunks():
+            yield b"data:,"
+            yield b"a"
+            raise OSError("connection lost")
+
+        with pytest.raises(DataURIError, match="incomplete data URI input") as exc_info:
+            parse_data_uri_stream(interrupted_chunks(), sink)
+
+        assert exc_info.value.bytes_written == 1
+        assert sink.getvalue() == b"existing:a"
+
+    @pytest.mark.parametrize("payload", [b"QQ==QQ==", b"QQ=QQQ=", b"AA!A", b"AAAA####"])
+    def test_stream_base64_rejects_bad_tail_and_middle_padding(self, payload):
+        sink = BytesIO()
+
+        with pytest.raises(DataURIError, match="invalid data URI"):
+            parse_data_uri_stream([b"data:;base64," + payload], sink)
+
+        assert sink.getvalue() == b""
+
+    def test_stream_base64_bad_tail_after_data_reports_bytes(self):
+        sink = BytesIO()
+
+        with pytest.raises(DataURIError, match="invalid data URI") as exc_info:
+            parse_data_uri_stream([b"data:;base64,SGVsbG8=!"], sink)
+
+        assert exc_info.value.bytes_written == 0
+        assert sink.getvalue() == b""
 
 
 class TestParseQsl:

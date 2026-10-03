@@ -17,6 +17,7 @@ from urllib.parse import ParseResult, urljoin
 from urllib.request import pathname2url
 
 from ._url import (
+    _hex_decode_table,
     _PATH_SAFE_CHARS,
     _SAFE_CHARS,
     _SCHEME_RE,
@@ -45,9 +46,14 @@ from ._url import (
 from ._util import to_unicode
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
+
+    from typing import Protocol
 
     from ._types import AnyUnicodeError
+
+    class _DataURISink(Protocol):
+        def write(self, data: bytes) -> int: ...
 
 
 # error handling function for bytes-to-Unicode decoding errors with URLs
@@ -581,6 +587,347 @@ class ParseDataURIResult(NamedTuple):
     data: bytes
 
 
+class StreamParseDataURIResult(NamedTuple):
+    """Named tuple returned by :func:`parse_data_uri_stream`."""
+
+    #: MIME type type and subtype, separated by / (e.g. ``"text/plain"``).
+    media_type: str
+    #: MIME type parameters (e.g. ``{"charset": "US-ASCII"}``).
+    media_type_parameters: dict[str, str]
+    #: Number of decoded bytes written to the sink.
+    bytes_written: int
+
+
+DEFAULT_DATA_URI_MAX_METADATA_LENGTH = 65536
+DEFAULT_DATA_URI_MAX_DATA_SIZE = 16 * 1024 * 1024
+
+
+class DataURIError(ValueError):
+    """Invalid or incomplete data URI."""
+
+    def __init__(self, message: str, *, bytes_written: int = 0) -> None:
+        super().__init__(message)
+        self.bytes_written = bytes_written
+
+
+class _PercentDecoder:
+    def __init__(self) -> None:
+        self._pending = b""
+
+    def feed(self, data: bytes) -> bytes:
+        output = bytearray()
+        data = self._pending + data
+        self._pending = b""
+        index = 0
+        hex_table = _hex_decode_table()
+
+        while index < len(data):
+            if data[index] != 37:  # ord("%")
+                output.append(data[index])
+                index += 1
+                continue
+
+            if index + 3 <= len(data):
+                high_nibble = hex_table[data[index + 1]]
+                low_nibble = hex_table[data[index + 2]]
+                if (high_nibble | low_nibble) != 255:
+                    output.append((high_nibble << 4) | low_nibble)
+                    index += 3
+                    continue
+                output.append(data[index])
+                index += 1
+                continue
+
+            suffix = data[index:]
+            if len(suffix) == 1 or (
+                len(suffix) == 2 and hex_table[suffix[1]] != 255
+            ):
+                self._pending = suffix
+            else:
+                output.extend(suffix)
+            break
+
+        return bytes(output)
+
+    def finish(self) -> bytes:
+        pending = self._pending
+        self._pending = b""
+        return pending
+
+
+_BASE64_ALPHABET = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+)
+_BASE64_DECODE_TABLE = bytearray([255]) * 256
+for _base64_index, _base64_byte in enumerate(_BASE64_ALPHABET):
+    _BASE64_DECODE_TABLE[_base64_byte] = _base64_index
+_BASE64_DECODE_TABLE = bytes(_BASE64_DECODE_TABLE)
+_BASE64_WHITESPACE = b" \t\n\r\x0b\x0c"
+
+
+class _Base64Decoder:
+    def __init__(self) -> None:
+        self._group = bytearray()
+        self._final_group = bytearray()
+        self._final_expected_padding = 0
+        self._padding = 0
+
+    def _decode_full_group(self, group: bytearray | bytes) -> bytes:
+        return bytes(
+            [
+                ((group[0] << 2) | (group[1] >> 4)) & 255,
+                ((group[1] << 4) | (group[2] >> 2)) & 255,
+                ((group[2] << 6) | group[3]) & 255,
+            ]
+        )
+
+    def _decode_final_group(self, group: bytearray | bytes) -> bytes:
+        first = ((group[0] << 2) | (group[1] >> 4)) & 255
+        if len(group) == 2:
+            return bytes([first])
+        return bytes(
+            [
+                first,
+                ((group[1] << 4) | (group[2] >> 2)) & 255,
+            ]
+        )
+
+    def feed(self, data: bytes) -> bytes:
+        output = bytearray()
+
+        for byte in data:
+            if byte in _BASE64_WHITESPACE:
+                continue
+
+            if byte == 61:  # ord("=")
+                self._padding += 1
+                if self._padding == 1:
+                    if len(self._group) not in (2, 3):
+                        raise DataURIError("invalid data URI")
+                    self._final_group = bytearray(self._group)
+                    self._final_expected_padding = 4 - len(self._group)
+                    self._group.clear()
+                elif self._padding == 2:
+                    if self._final_expected_padding not in (1, 2):
+                        raise DataURIError("invalid data URI")
+                else:
+                    raise DataURIError("invalid data URI")
+                continue
+
+            if self._padding:
+                raise DataURIError("invalid data URI")
+
+            value = _BASE64_DECODE_TABLE[byte]
+            if value == 255:
+                raise DataURIError("invalid data URI")
+            self._group.append(value)
+
+            if len(self._group) == 4:
+                output.extend(self._decode_full_group(self._group))
+                self._group.clear()
+
+        return bytes(output)
+
+    def finish(self) -> bytes:
+        if self._padding == 0:
+            if self._group:
+                raise DataURIError("invalid data URI")
+            return b""
+
+        if self._group:
+            raise DataURIError("invalid data URI")
+        if self._padding == 1:
+            if len(self._final_group) != 3:
+                raise DataURIError("invalid data URI")
+            return self._decode_final_group(self._final_group)
+        if self._final_expected_padding not in (1, 2):
+            raise DataURIError("invalid data URI")
+        return self._decode_final_group(self._final_group)
+
+
+def _parse_data_uri_metadata(metadata: bytes) -> tuple[str, dict[str, str], bool]:
+    media_type = "text/plain"
+    media_type_params = {"charset": "US-ASCII"}
+
+    match = _mediatype_pattern.match(metadata)
+    if match:
+        media_type = match.group().decode()
+        metadata = metadata[match.end() :]
+        media_type_params = {}
+
+    while match := _mediatype_parameter_pattern.match(metadata):
+        attribute, value, value_quoted = match.groups()
+        if value_quoted is not None:
+            value = re.sub(rb"\\(.)", rb"\1", value_quoted)
+        media_type_params[attribute.decode()] = value.decode()
+        metadata = metadata[match.end() :]
+
+    is_base64 = metadata == b";base64"
+    if metadata and not is_base64:
+        raise DataURIError("invalid data URI")
+
+    return media_type, media_type_params, is_base64
+
+
+def _extract_scheme(
+    chunk: bytes, state: bytearray
+) -> tuple[bytes, bytes, bool]:
+    data = chunk if not state else bytes(state) + chunk
+    colon = data.find(b":")
+    if colon < 0:
+        state.clear()
+        state.extend(data)
+        return bytes(state), b"", False
+
+    scheme = data[:colon]
+    remaining = data[colon + 1 :]
+    state.clear()
+    return scheme, remaining, True
+
+
+def _write_data_uri_output(
+    sink: _DataURISink,
+    data: bytes,
+    bytes_written: int,
+    max_data_size: int,
+) -> int:
+    if not data:
+        return bytes_written
+
+    if len(data) > max_data_size - bytes_written:
+        raise DataURIError(
+            "decoded data URI data exceeds the maximum size; "
+            f"{bytes_written} bytes may already be present in the sink",
+            bytes_written=bytes_written,
+        )
+
+    try:
+        written = sink.write(data)
+    except Exception as error:
+        raise DataURIError(
+            "data URI sink write failed; "
+            f"{bytes_written} bytes may already be present in the sink",
+            bytes_written=bytes_written,
+        ) from error
+
+    if written != len(data):
+        raise DataURIError(
+            "data URI sink wrote an unexpected number of bytes; "
+            f"{bytes_written} bytes may already be present in the sink",
+            bytes_written=bytes_written,
+        )
+
+    return bytes_written + len(data)
+
+
+def parse_data_uri_stream(
+    chunks: Iterable[str | bytes],
+    sink: _DataURISink,
+    *,
+    max_metadata_length: int = DEFAULT_DATA_URI_MAX_METADATA_LENGTH,
+    max_data_size: int = DEFAULT_DATA_URI_MAX_DATA_SIZE,
+) -> StreamParseDataURIResult:
+    """Parse chunked data URI input and write decoded data to *sink*.
+
+    Metadata is fully collected and validated before any decoded data is
+    written. Percent-encoded bytes and base64 groups may span chunk
+    boundaries. Size limits are checked using the decoded byte count.
+
+    On failure, the exception's ``bytes_written`` attribute reports bytes
+    written by this function. The sink is not rolled back and may contain
+    additional bytes it wrote itself.
+    """
+    if max_metadata_length < 0:
+        raise ValueError("max_metadata_length must be non-negative")
+    if max_data_size < 0:
+        raise ValueError("max_data_size must be non-negative")
+
+    scheme_state = bytearray()
+    raw_metadata = bytearray()
+    scheme_seen = False
+    percent_decoder = _PercentDecoder()
+    base64_decoder: _Base64Decoder | None = None
+    metadata_result: tuple[str, dict[str, str], bool] | None = None
+    bytes_written = 0
+
+    def write_output(data: bytes) -> None:
+        nonlocal bytes_written
+        bytes_written = _write_data_uri_output(
+            sink, data, bytes_written, max_data_size
+        )
+
+    try:
+        for chunk in chunks:
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            elif not isinstance(chunk, bytes):
+                raise TypeError("chunks must contain bytes or text")
+
+            if metadata_result is None:
+                if not scheme_seen:
+                    scheme, chunk, scheme_seen = _extract_scheme(chunk, scheme_state)
+                    if not scheme_seen:
+                        if len(scheme) > 4 + max_metadata_length:
+                            raise DataURIError("not a data URI")
+                        continue
+                    if not scheme or scheme.lower() != b"data":
+                        raise DataURIError(
+                            "not a data URI" if scheme else "invalid URI"
+                        )
+
+                comma = chunk.find(b",")
+                if comma < 0:
+                    raw_metadata.extend(chunk)
+                    if len(raw_metadata) > max_metadata_length:
+                        raise DataURIError(
+                            "data URI metadata exceeds the maximum length"
+                        )
+                    continue
+
+                raw_metadata.extend(chunk[:comma])
+                if len(raw_metadata) > max_metadata_length:
+                    raise DataURIError("data URI metadata exceeds the maximum length")
+                chunk = chunk[comma + 1 :]
+                metadata_result = _parse_data_uri_metadata(
+                    _unquote(bytes(raw_metadata))
+                )
+                _, _, is_base64 = metadata_result
+                if is_base64:
+                    base64_decoder = _Base64Decoder()
+
+            decoded_chunk = percent_decoder.feed(chunk)
+            if base64_decoder is not None:
+                decoded_chunk = base64_decoder.feed(decoded_chunk)
+            write_output(decoded_chunk)
+
+        if metadata_result is None:
+            raise DataURIError("invalid URI" if not scheme_seen else "invalid data URI")
+
+        decoded_chunk = percent_decoder.finish()
+        if base64_decoder is not None:
+            decoded_chunk = base64_decoder.feed(decoded_chunk)
+            decoded_chunk += base64_decoder.finish()
+        write_output(decoded_chunk)
+    except DataURIError as error:
+        if bytes_written and not error.bytes_written:
+            raise DataURIError(
+                f"{error}; {bytes_written} bytes may already be present in the sink",
+                bytes_written=bytes_written,
+            ) from error
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        if isinstance(error, TypeError) and "chunks must contain" in str(error):
+            raise
+        raise DataURIError(
+            "incomplete data URI input; "
+            f"{bytes_written} bytes may already be present in the sink",
+            bytes_written=bytes_written,
+        ) from error
+
+    media_type, media_type_params, _ = metadata_result
+    return StreamParseDataURIResult(media_type, media_type_params, bytes_written)
+
+
 def parse_data_uri(uri: str | bytes) -> ParseDataURIResult:
     """Parse a data: URI into :class:`ParseDataURIResult`."""
     if not isinstance(uri, bytes):
@@ -592,31 +939,23 @@ def parse_data_uri(uri: str | bytes) -> ParseDataURIResult:
     if scheme.lower() != b"data":
         raise ValueError("not a data URI")
 
-    # RFC 3986 section 2.1 allows percent encoding to escape characters that
-    # would be interpreted as delimiters, implying that actual delimiters
-    # should not be percent-encoded.
-    # Decoding before parsing will allow malformed URIs with percent-encoded
-    # delimiters, but it makes parsing easier and should not affect
-    # well-formed URIs, as the delimiters used in this URI scheme are not
-    # allowed, percent-encoded or not, in tokens.
     uri = _unquote(uri)
-
     media_type = "text/plain"
     media_type_params = {}
 
-    m = _mediatype_pattern.match(uri)
-    if m:
-        media_type = m.group().decode()
-        uri = uri[m.end() :]
+    match = _mediatype_pattern.match(uri)
+    if match:
+        media_type = match.group().decode()
+        uri = uri[match.end() :]
     else:
         media_type_params["charset"] = "US-ASCII"
 
-    while m := _mediatype_parameter_pattern.match(uri):
-        attribute, value, value_quoted = m.groups()
+    while match := _mediatype_parameter_pattern.match(uri):
+        attribute, value, value_quoted = match.groups()
         if value_quoted is not None:
             value = re.sub(rb"\\(.)", rb"\1", value_quoted)
         media_type_params[attribute.decode()] = value.decode()
-        uri = uri[m.end() :]
+        uri = uri[match.end() :]
 
     is_base64, _, data = uri.partition(b",")
     if is_base64:
@@ -628,6 +967,10 @@ def parse_data_uri(uri: str | bytes) -> ParseDataURIResult:
 
 
 __all__ = [
+    "DataURIError",
+    "DEFAULT_DATA_URI_MAX_DATA_SIZE",
+    "DEFAULT_DATA_URI_MAX_METADATA_LENGTH",
+    "StreamParseDataURIResult",
     "add_http_if_no_scheme",
     "add_or_replace_parameter",
     "add_or_replace_parameters",
@@ -636,6 +979,7 @@ __all__ = [
     "file_uri_to_path",
     "is_url",
     "parse_data_uri",
+    "parse_data_uri_stream",
     "path_to_file_uri",
     "safe_download_url",
     "safe_url_string",
