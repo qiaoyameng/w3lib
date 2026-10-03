@@ -1,6 +1,18 @@
 w3lib release notes
 ===================
 
+2.6.0 (unreleased)
+------------------
+
+New features:
+
+- Added the :mod:`w3lib.psl` module with
+  :class:`~w3lib.psl.PublicSuffixList`, an offline Public Suffix List
+  querier: the caller supplies the rule text, and lookups return the public
+  suffix, the registrable domain and the matched rule and list section.
+  Plain, wildcard and exception rules are supported, as well as the
+  optional ``PRIVATE`` section.
+
 2.5.0 (2026-09-30)
 ------------------
 
