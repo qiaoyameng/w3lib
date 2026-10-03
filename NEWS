@@ -1,6 +1,15 @@
 w3lib release notes
 ===================
 
+unreleased
+----------
+
+New features:
+
+- Added :func:`~w3lib.html.parse_srcset` and :class:`~w3lib.html.SrcsetCandidate`
+  for parsing the image candidates of an HTML ``srcset`` attribute, including
+  commas inside data URLs and parenthesized URLs.
+
 2.5.0 (2026-09-30)
 ------------------
 

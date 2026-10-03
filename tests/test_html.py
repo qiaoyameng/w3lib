@@ -4,9 +4,11 @@ import pytest
 from hypothesis import given, strategies as st
 
 from w3lib.html import (
+    SrcsetCandidate,
     get_base_url,
     get_meta_refresh,
     has_entities,
+    parse_srcset,
     remove_comments,
     remove_tags,
     remove_tags_with_content,
@@ -15,6 +17,217 @@ from w3lib.html import (
     replace_tags,
     unquote_markup,
 )
+
+
+class TestParseSrcset:
+    def test_candidates_descriptors_and_positions(self):
+        srcset = "  small.jpg \t 480w\n,\n large.jpg 2.5x "
+
+        assert parse_srcset(srcset) == [
+            SrcsetCandidate(
+                "small.jpg",
+                480,
+                None,
+                "small.jpg",
+                2,
+                18,
+            ),
+            SrcsetCandidate(
+                "large.jpg",
+                None,
+                2.5,
+                "large.jpg",
+                22,
+                36,
+            ),
+        ]
+        assert [candidate.position for candidate in parse_srcset(srcset)] == [
+            (2, 18),
+            (22, 36),
+        ]
+
+    def test_url_without_descriptor_defaults_to_density_one(self):
+        assert parse_srcset("small.jpg") == [
+            SrcsetCandidate("small.jpg", None, 1.0, "small.jpg", 0, 9)
+        ]
+
+    def test_data_url_with_commas(self):
+        data_url = "data:text/plain;charset=utf-8,hello,world"
+        result = parse_srcset(f"{data_url} 2x, next.jpg 100w")
+        assert result == [
+            SrcsetCandidate(data_url, None, 2.0, data_url, 0, len(data_url) + 3),
+            SrcsetCandidate(
+                "next.jpg",
+                100,
+                None,
+                "next.jpg",
+                len(data_url) + 5,
+                len(data_url) + 18,
+            ),
+        ]
+
+    def test_data_url_comma_followed_by_whitespace_separates_candidates(self):
+        result = parse_srcset("data:text/plain,hello, world.jpg")
+
+        assert [candidate.original_url for candidate in result] == [
+            "data:text/plain,hello",
+            "world.jpg",
+        ]
+
+    def test_base_url_preserves_original_url(self):
+        result = parse_srcset(
+            "img/small.jpg 480w, https://cdn.test/large.jpg 2x",
+            base_url="https://example.test/path/page",
+        )
+
+        assert [candidate.url for candidate in result] == [
+            "https://example.test/path/img/small.jpg",
+            "https://cdn.test/large.jpg",
+        ]
+        assert [candidate.original_url for candidate in result] == [
+            "img/small.jpg",
+            "https://cdn.test/large.jpg",
+        ]
+        assert result[0].original_url == "img/small.jpg"
+        assert result[1].density == 2.0
+
+    def test_bytes_are_decoded_before_recording_positions(self):
+        result = parse_srcset(
+            "é.jpg 1x, café.jpg 2x".encode(),
+            base_url="https://example.test/",
+        )
+
+        assert [(candidate.url, candidate.position) for candidate in result] == [
+            ("https://example.test/%C3%A9.jpg", (0, 8)),
+            ("https://example.test/caf%C3%A9.jpg", (10, 21)),
+        ]
+
+    @pytest.mark.parametrize(
+        "srcset",
+        [
+            ", good.jpg 1x",
+            "  , good.jpg 1x",
+            "bad.jpg  1w 2x, good.jpg 1x",
+            "bad.jpg 1w 2w, good.jpg 1x",
+            "bad.jpg 1x 2x, good.jpg 1x",
+            "bad.jpg -1w, good.jpg 1x",
+            "bad.jpg -0.5x, good.jpg 1x",
+            "bad.jpg 1W, good.jpg 1x",
+            "bad.jpg 1X, good.jpg 1x",
+            "bad.jpg 1h, good.jpg 1x",
+            "bad.jpg onew, good.jpg 1x",
+            "bad.jpg one.x, good.jpg 1x",
+            "bad.jpg (1w), good.jpg 1x",
+            "bad.jpg 1e999x, good.jpg 1x",
+            "bad.jpg infx, good.jpg 1x",
+            "(unclosed, good.jpg 1x",
+        ],
+    )
+    def test_bad_candidate_does_not_consume_following_candidate(self, srcset):
+        result = parse_srcset(srcset)
+
+        assert len(result) == 1
+        assert result[0].original_url == "good.jpg"
+        assert result[0].density == 1.0
+
+    @pytest.mark.parametrize(
+        "srcset",
+        [
+            "",
+            "   ",
+            ",,,",
+            " ,  ,\t,",
+            "bad.jpg 1w 2x",
+            "bad.jpg (1w), good.jpg (",
+            "bad.jpg 1e999x",
+        ],
+    )
+    def test_no_candidates(self, srcset):
+        assert parse_srcset(srcset) == []
+
+    def test_empty_descriptor_defaults_to_density_one(self):
+        result = parse_srcset("first.jpg   , second.jpg")
+
+        assert [
+            (candidate.original_url, candidate.density) for candidate in result
+        ] == [
+            ("first.jpg", 1.0),
+            ("second.jpg", 1.0),
+        ]
+
+    @pytest.mark.parametrize(
+        "descriptor",
+        ["1e3x", ".5e-1x", "1.x", "0.000001x"],
+    )
+    def test_floating_point_density_descriptors(self, descriptor):
+        result = parse_srcset(f"good.jpg {descriptor}")
+
+        assert result[0].density > 0
+
+    @pytest.mark.parametrize(
+        ("descriptor", "value"),
+        [("0w", 0), ("0001w", 1)],
+    )
+    def test_zero_width_is_allowed(self, descriptor, value):
+        result = parse_srcset(f"good.jpg {descriptor}")
+
+        assert result[0].width == value
+        assert result[0].density is None
+
+    @pytest.mark.parametrize("descriptor", ["0x", "0.0x", "0e1x"])
+    def test_zero_density_is_rejected(self, descriptor):
+        result = parse_srcset(f"bad.jpg {descriptor}, good.jpg 1x")
+
+        assert [candidate.original_url for candidate in result] == ["good.jpg"]
+
+    def test_legacy_url_ending_with_opening_parenthesis(self):
+        result = parse_srcset("(x( 1x, good.jpg 2x")
+
+        assert [candidate.original_url for candidate in result][-1] == "good.jpg"
+
+    def test_multiple_whitespace_inside_legacy_parentheses(self):
+        result = parse_srcset("( legacy.png ) 2x, good.jpg 1x")
+
+        assert [
+            (candidate.original_url, candidate.density) for candidate in result
+        ] == [
+            ("legacy.png", 2.0),
+            ("good.jpg", 1.0),
+        ]
+
+    @pytest.mark.parametrize(
+        ("url", "raw_url"),
+        [
+            ("(legacy.png)", "legacy.png"),
+            ("('legacy.png')", "legacy.png"),
+            ('("legacy.png")', "legacy.png"),
+        ],
+    )
+    def test_legacy_parenthesized_url(self, url, raw_url):
+        result = parse_srcset(f"{url} 2x")
+        assert result == [
+            SrcsetCandidate(raw_url, None, 2.0, raw_url, 0, len(url) + 3)
+        ]
+
+    def test_commas_in_parenthesized_url(self):
+        result = parse_srcset(
+            "https://example.test/(a,b).jpg 2x, next.jpg 1x"
+        )
+
+        assert [candidate.original_url for candidate in result] == [
+            "https://example.test/(a,b).jpg",
+            "next.jpg",
+        ]
+
+    def test_unresolvable_relative_url_is_skipped(self):
+        result = parse_srcset(
+            "fragment-only 1x, https://example.test/good.jpg 2x",
+            base_url="mailto:a@example.test",
+        )
+
+        assert [candidate.original_url for candidate in result] == [
+            "https://example.test/good.jpg"
+        ]
 
 
 class TestRemoveEntities:

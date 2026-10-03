@@ -5,15 +5,16 @@ Functions for dealing with markup text
 from __future__ import annotations
 
 import functools
+import math
 import re
 from html.entities import name2codepoint
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from w3lib._util import _COMMENT, _attr_re, _scannable, iter_tag_attributes, to_unicode
 from w3lib.url import _urljoin, safe_url_string
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
 
 # Character references are ASCII digits only; \d would also match the Unicode
@@ -145,6 +146,322 @@ def _build_meta_scan_bytes_pattern(ignore_tags: tuple[str, ...]) -> re.Pattern[b
 
 
 HTML5_WHITESPACE = " \t\n\r\x0c"
+_SRCSET_DENSITY_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+class SrcsetCandidate(NamedTuple):
+    """An image candidate parsed from a ``srcset`` attribute."""
+
+    #: The URL, resolved against the base URL when one was supplied.
+    url: str
+    #: The width descriptor in pixels, or ``None`` when absent.
+    width: int | None
+    #: The pixel density descriptor, or ``None`` for a width candidate.
+    density: float | None
+    #: The URL as written in the attribute, before resolving it.
+    original_url: str
+    #: Start offset of the candidate in the decoded attribute value.
+    start: int
+    #: End offset of the candidate in the decoded attribute value.
+    end: int
+
+    @property
+    def position(self) -> tuple[int, int]:
+        """The candidate's ``(start, end)`` offsets."""
+        return self.start, self.end
+
+
+# A concise public spelling for readers who style the attribute name srcSet.
+SrcSetCandidate = SrcsetCandidate
+
+
+def _srcset_data_comma(text: str, start: int) -> int:
+    scheme = "data:"
+    if text[start : start + len(scheme)].lower() != scheme:
+        return -1
+
+    position = start + len(scheme)
+    comma_position = -1
+    whitespace_position = -1
+    while position < len(text):
+        character = text[position]
+        if character == "," and comma_position == -1:
+            comma_position = position
+        if character in HTML5_WHITESPACE:
+            whitespace_position = position
+            break
+        position += 1
+    if comma_position != -1 and (
+        whitespace_position == -1 or comma_position < whitespace_position
+    ):
+        return comma_position
+    return -1
+
+
+def _iter_srcset_candidate_fragments(
+    text: str, position: int = 0
+) -> Iterator[tuple[int, int, str]]:
+    length = len(text)
+
+    while position < length:
+        while position < length and text[position] in HTML5_WHITESPACE:
+            position += 1
+        if position == length:
+            return
+
+        start = position
+        parenthesis_depth = 0
+        in_data_url_payload = False
+        data_url_comma = -1
+
+        # A data URL's payload starts at its first comma and may itself
+        # contain commas. That comma is only part of the URL when it occurs
+        # before the whitespace ending the URL token.
+        data_url_comma = _srcset_data_comma(text, position)
+
+        while position < length:
+            character = text[position]
+
+            if position == data_url_comma:
+                in_data_url_payload = True
+                data_url_comma = -1
+                position += 1
+                continue
+
+            if in_data_url_payload and character in HTML5_WHITESPACE:
+                in_data_url_payload = False
+
+            data_payload_comma = in_data_url_payload and character == ","
+            if data_payload_comma and position + 1 < length:
+                data_payload_comma = (
+                    text[position + 1] not in HTML5_WHITESPACE
+                )
+
+            if data_payload_comma:
+                position += 1
+                continue
+
+            if character == "," and parenthesis_depth == 0:
+                fragment = text[start:position]
+                trail = len(fragment) - len(fragment.rstrip(HTML5_WHITESPACE))
+                if fragment:
+                    end = position - trail
+                    yield start, end, fragment[: len(fragment) - trail]
+                position += 1
+                break
+
+            if not in_data_url_payload and character == "(":
+                parenthesis_depth += 1
+            elif not in_data_url_payload and character == ")":
+                parenthesis_depth = max(0, parenthesis_depth - 1)
+
+            position += 1
+        else:
+            fragment = text[start:length]
+            trail = len(fragment) - len(fragment.rstrip(HTML5_WHITESPACE))
+            if fragment:
+                end = length - trail
+                candidate_fragment = fragment[: len(fragment) - trail]
+                if parenthesis_depth > 0:
+                    stack: list[int] = []
+                    for index, character in enumerate(candidate_fragment):
+                        if character == "(":
+                            stack.append(index)
+                        elif character == ")" and stack:
+                            stack.pop()
+                    if stack and (
+                        comma_position := candidate_fragment.find(",", stack[0])
+                    ) != -1:
+                        yield from _iter_srcset_candidate_fragments(
+                            text, start + comma_position + 1
+                        )
+                        return
+                yield start, end, candidate_fragment
+            return
+
+
+def _unwrap_legacy_srcset_url(url: str) -> str | None:
+    if not url.startswith("("):
+        return url
+    url = url.rstrip(HTML5_WHITESPACE + "(")
+    outer_closing_parenthesis = -1
+    pending: list[int] = []
+    quote = ""
+    for index, character in enumerate(url):
+        if quote:
+            if character == quote:
+                quote = ""
+            continue
+        if character in "'\"":
+            quote = character
+        elif character == "(":
+            pending.append(index)
+        elif character == ")" and pending:
+            if pending.pop() == 0:
+                outer_closing_parenthesis = index
+    if outer_closing_parenthesis == -1:
+        return url
+
+    url = url[1:outer_closing_parenthesis].strip(HTML5_WHITESPACE)
+    if len(url) >= 2 and url[0] in "'\"" and url[-1] == url[0]:
+        url = url[1:-1].strip(HTML5_WHITESPACE)
+    return url or None
+
+
+def _parse_srcset_descriptors(
+    descriptors: str,
+) -> tuple[int | None, float | None] | None:
+    tokens: list[str] = []
+    position = 0
+
+    while position < len(descriptors):
+        while (
+            position < len(descriptors)
+            and descriptors[position] in HTML5_WHITESPACE
+        ):
+            position += 1
+        token_start = position
+        while (
+            position < len(descriptors)
+            and descriptors[position] not in HTML5_WHITESPACE
+        ):
+            position += 1
+        if position > token_start:
+            tokens.append(descriptors[token_start:position])
+
+    width: int | None = None
+    density: float | None = None
+
+    for token in tokens:
+        if token.endswith("w"):
+            number = token[:-1]
+            if not number.isascii() or not number.isdigit():
+                return None
+            value = int(number)
+            if width is not None:
+                return None
+            width = value
+        elif token.endswith("x"):
+            number = token[:-1]
+            if (
+                not _SRCSET_DENSITY_RE.fullmatch(number)
+                or number.startswith(("-", "+"))
+            ):
+                return None
+            value = float(number)
+            if density is not None or not math.isfinite(value) or value <= 0:
+                return None
+            density = value
+        else:
+            return None
+
+    if width is not None and density is not None:
+        return None
+    if width is None and density is None:
+        density = 1.0
+    return width, density
+
+
+def _matched_srcset_parentheses(fragment: str) -> set[int]:
+    matching_opening: set[int] = set()
+    pending: list[int] = []
+    quote = ""
+    for position, character in enumerate(fragment):
+        if quote:
+            if character == quote:
+                quote = ""
+        elif character in "'\"":
+            quote = character
+        elif character == "(":
+            pending.append(position)
+        elif character == ")" and pending:
+            matching_opening.add(pending.pop())
+    return matching_opening
+
+
+def _srcset_url_end(fragment: str) -> int:
+    if fragment.lower().startswith("data:") and (
+        comma_position := fragment.find(",", len("data:"))
+    ) != -1:
+        position = comma_position + 1
+        while position < len(fragment):
+            if fragment[position] in HTML5_WHITESPACE:
+                return position
+            position += 1
+        return position
+
+    stack: list[int] = []
+    matching_opening = _matched_srcset_parentheses(fragment)
+    for position, character in enumerate(fragment):
+        if character == "(":
+            stack.append(position)
+        elif character == ")":
+            if stack:
+                stack.pop()
+        elif character in HTML5_WHITESPACE and not any(
+            opening in matching_opening for opening in stack
+        ):
+            return position
+    return len(fragment)
+
+
+def parse_srcset(
+    srcset: str | bytes,
+    base_url: str | bytes | None = None,
+    encoding: str = "utf-8",
+) -> list[SrcsetCandidate]:
+    """Parse the image candidates in an HTML ``srcset`` attribute.
+
+    Candidate text is tokenized according to the HTML rules for commas,
+    ASCII whitespace and parentheses. In particular, a comma inside a data URL
+    or a parenthesized URL does not start another candidate.
+
+    Malformed candidates are omitted, without affecting candidates after them.
+    Width and density descriptors cannot be negative, repeated, or mixed in one
+    candidate. This function only parses candidates; it does not choose one.
+
+    When *base_url* is supplied, each candidate's relative
+    :attr:`SrcsetCandidate.original_url` is resolved to produce
+    :attr:`SrcsetCandidate.url`. Without it, the two are equal.
+
+    >>> from w3lib.html import parse_srcset
+    >>> parse_srcset("small.jpg 480w")[0].width
+    480
+    """
+
+    text = to_unicode(srcset, encoding)
+    candidates: list[SrcsetCandidate] = []
+
+    for start, end, fragment in _iter_srcset_candidate_fragments(text):
+        url_end = _srcset_url_end(fragment)
+        raw_url = _unwrap_legacy_srcset_url(fragment[:url_end])
+        if raw_url is None:
+            continue
+
+        descriptors = _parse_srcset_descriptors(fragment[url_end:])
+        if descriptors is None:
+            continue
+        width, density = descriptors
+
+        if base_url is None:
+            url = raw_url
+        else:
+            try:
+                url = safe_url_string(
+                    _urljoin(
+                        safe_url_string(to_unicode(base_url, encoding)),
+                        raw_url,
+                    ),
+                    encoding=encoding,
+                )
+            except ValueError:
+                continue
+
+        candidates.append(
+            SrcsetCandidate(url, width, density, raw_url, start, end)
+        )
+
+    return candidates
 
 
 def replace_entities(
