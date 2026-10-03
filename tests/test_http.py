@@ -5,6 +5,7 @@ from w3lib.http import (
     basic_auth_header,
     headers_dict_to_raw,
     headers_raw_to_dict,
+    parse_content_disposition,
 )
 
 
@@ -84,3 +85,204 @@ class TestHttp:
 
         dct = OrderedDict([(b"Content-type", 1), (b"Accept", [b"gzip"])])
         assert headers_dict_to_raw(dct) == b"Accept: gzip"
+
+
+class TestParseContentDisposition:
+    def test_none(self):
+        assert parse_content_disposition(None) is None
+
+    def test_empty(self):
+        result = parse_content_disposition("")
+        assert result is not None
+        assert result.disposition == ""
+        assert result.params == {}
+        assert result.filename is None
+        assert result.safe_filename is None
+
+    def test_simple(self):
+        result = parse_content_disposition('Attachment; filename="report.csv"')
+        assert result is not None
+        assert result.disposition == "attachment"
+        assert result.params == {"filename": "report.csv"}
+        assert result.filename == "report.csv"
+        assert result.safe_filename == "report.csv"
+        assert result.warnings == ()
+
+    def test_bytes_header(self):
+        result = parse_content_disposition(b'attachment; filename="report.csv"')
+        assert result is not None
+        assert result.filename == "report.csv"
+
+    def test_semicolon_and_escape_in_quotes(self):
+        result = parse_content_disposition(
+            r'attachment; filename="a;b \"c\".txt"; x=1'
+        )
+        assert result is not None
+        assert result.filename == 'a;b "c".txt'
+        assert result.params == {"filename": 'a;b "c".txt', "x": "1"}
+
+    def test_unterminated_quote(self):
+        result = parse_content_disposition('attachment; filename="abc.txt')
+        assert result is not None
+        assert result.filename == "abc.txt"
+        assert any("unterminated" in w for w in result.warnings)
+
+    def test_ext_param_utf8(self):
+        result = parse_content_disposition(
+            "attachment; filename*=utf-8''%E6%8A%A5%E8%A1%A8.csv"
+        )
+        assert result is not None
+        assert result.filename == "报表.csv"
+        assert result.safe_filename == "报表.csv"
+        ext = result.ext_params["filename"]
+        assert ext.charset == "utf-8"
+        assert ext.language == ""
+        assert ext.value == "报表.csv"
+
+    def test_ext_param_language_and_charset_case(self):
+        result = parse_content_disposition(
+            "attachment; filename*=UTF-8'zh-CN'%E6%8A%A5%E8%A1%A8.csv"
+        )
+        assert result is not None
+        ext = result.ext_params["filename"]
+        assert ext.language == "zh-CN"
+        assert ext.value == "报表.csv"
+
+    def test_same_chinese_name_multiple_encodings(self):
+        name = "中文.txt"
+        for encoding in ("utf-8", "gbk", "big5"):
+            encoded = "".join(f"%{b:02X}" for b in name.encode(encoding))
+            result = parse_content_disposition(
+                f"attachment; filename*={encoding}''{encoded}"
+            )
+            assert result is not None
+            assert result.filename == name, encoding
+            assert result.safe_filename == name, encoding
+            assert result.warnings == (), encoding
+
+    def test_filename_star_wins_over_filename(self):
+        result = parse_content_disposition(
+            "attachment; filename=plain.txt; "
+            "filename*=utf-8''%E6%8A%A5%E8%A1%A8.csv"
+        )
+        assert result is not None
+        assert result.filename == "报表.csv"
+        # The losing parameter keeps its value, untouched.
+        assert result.params["filename"] == "plain.txt"
+
+    def test_unknown_charset_falls_back_to_filename(self):
+        result = parse_content_disposition(
+            "attachment; filename*=x-unknown''%41.txt; filename=plain.txt"
+        )
+        assert result is not None
+        assert result.filename == "plain.txt"
+        assert result.ext_params["filename"].value is None
+        assert result.ext_params["filename"].raw == "x-unknown''%41.txt"
+        assert any("unknown charset" in w for w in result.warnings)
+        assert any("falling back" in w for w in result.warnings)
+
+    def test_malformed_ext_param_shape(self):
+        result = parse_content_disposition(
+            "attachment; filename*=no-separators; filename=plain.txt"
+        )
+        assert result is not None
+        assert result.filename == "plain.txt"
+        assert result.ext_params["filename"].value is None
+        assert any("charset'language'value" in w for w in result.warnings)
+
+    def test_malformed_percent_kept_literally(self):
+        result = parse_content_disposition(
+            "attachment; filename*=utf-8''a%ZZb%2.txt"
+        )
+        assert result is not None
+        assert result.filename == "a%ZZb%2.txt"
+        assert any("malformed percent-encoding" in w for w in result.warnings)
+
+    def test_invalid_bytes_for_charset_replaced(self):
+        result = parse_content_disposition(
+            "attachment; filename*=utf-8''%FF.txt"
+        )
+        assert result is not None
+        assert result.filename == "�.txt"
+        assert any("not valid utf-8" in w for w in result.warnings)
+
+    def test_duplicate_params_keep_first(self):
+        result = parse_content_disposition(
+            "attachment; filename=one.txt; filename=two.txt; "
+            "filename*=utf-8''a.txt; filename*=utf-8''b.txt"
+        )
+        assert result is not None
+        assert result.params["filename"] == "one.txt"
+        assert result.ext_params["filename"].value == "a.txt"
+        assert sum("duplicate" in w for w in result.warnings) == 2
+
+    def test_parameter_without_value(self):
+        result = parse_content_disposition("attachment; filename=a.txt; loose")
+        assert result is not None
+        assert "loose" not in result.params
+        assert any("no value" in w for w in result.warnings)
+
+    def test_other_params_not_rewritten(self):
+        result = parse_content_disposition(
+            "attachment; filename*=utf-8''%E6%8A%A5%E8%A1%A8.csv; "
+            'name="field;name"; size=10; creation-date="Wed, 01 Jan 2020"'
+        )
+        assert result is not None
+        assert result.params == {
+            "name": "field;name",
+            "size": "10",
+            "creation-date": "Wed, 01 Jan 2020",
+        }
+        assert list(result.ext_params) == ["filename"]
+
+    def test_path_traversal_unix(self):
+        result = parse_content_disposition(
+            "attachment; filename=../../etc/passwd"
+        )
+        assert result is not None
+        assert result.filename == "../../etc/passwd"
+        assert result.safe_filename == "passwd"
+        assert any("directory components" in w for w in result.warnings)
+
+    def test_path_traversal_windows(self):
+        result = parse_content_disposition(
+            r'attachment; filename="C:\Windows\system32\evil.dll"'
+        )
+        assert result is not None
+        assert result.filename == r"C:\Windows\system32\evil.dll"
+        assert result.safe_filename == "evil.dll"
+
+    def test_control_characters_removed(self):
+        result = parse_content_disposition(
+            'attachment; filename="a\tb\x00c.txt"'
+        )
+        assert result is not None
+        assert result.filename == "a\tb\x00c.txt"
+        assert result.safe_filename == "abc.txt"
+        assert any("control characters" in w for w in result.warnings)
+
+    def test_trailing_dots_and_spaces_removed(self):
+        result = parse_content_disposition('attachment; filename="name.txt. "')
+        assert result is not None
+        assert result.filename == "name.txt. "
+        assert result.safe_filename == "name.txt"
+
+    def test_no_usable_filename(self):
+        for header in (
+            'attachment; filename=""',
+            'attachment; filename="../.."',
+            'attachment; filename="   "',
+            "attachment; filename*=utf-8''",
+        ):
+            result = parse_content_disposition(header)
+            assert result is not None
+            assert result.safe_filename is None, header
+            assert any("no usable filename" in w for w in result.warnings)
+
+    def test_no_filename_at_all(self):
+        result = parse_content_disposition("inline")
+        assert result is not None
+        assert result.disposition == "inline"
+        assert result.filename is None
+        assert result.safe_filename is None
+        assert result.warnings == ()

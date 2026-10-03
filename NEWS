@@ -1,6 +1,17 @@
 w3lib release notes
 ===================
 
+2.5.1 (unreleased)
+------------------
+
+New features:
+
+- Added :func:`~w3lib.http.parse_content_disposition`, which parses a
+  ``Content-Disposition`` header value into a structured result with the
+  disposition type, regular and RFC 8187 extended parameters, the filename
+  as sent and a sanitized variant safe for local saving, plus a list of
+  warnings describing every fallback taken while parsing.
+
 2.5.0 (2026-09-30)
 ------------------
 
