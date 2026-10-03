@@ -6,6 +6,7 @@ library.
 from __future__ import annotations
 
 import base64
+import binascii
 import codecs
 import os
 import posixpath
@@ -45,7 +46,8 @@ from ._url import (
 from ._util import to_unicode
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
+    from typing import BinaryIO
 
     from ._types import AnyUnicodeError
 
@@ -627,6 +629,339 @@ def parse_data_uri(uri: str | bytes) -> ParseDataURIResult:
     return ParseDataURIResult(media_type, media_type_params, data)
 
 
+class ParseDataURIStreamResult(NamedTuple):
+    """Named tuple returned by :func:`parse_data_uri_stream`."""
+
+    #: MIME type type and subtype, separated by / (e.g. ``"text/plain"``).
+    media_type: str
+    #: MIME type parameters (e.g. ``{"charset": "US-ASCII"}``).
+    media_type_parameters: dict[str, str]
+    #: Number of decoded data bytes written to the sink.
+    bytes_written: int
+
+
+_HEX_BYTES = b"0123456789abcdefABCDEF"
+
+
+class _PercentDecoder:
+    """Incrementally decode %HH sequences, like :func:`~w3lib._url._unquote`.
+
+    Up to 2 bytes are kept back when a chunk ends in the middle of a
+    percent-encoded triplet; they are decoded once the rest of the triplet
+    arrives, or passed through verbatim at the end of the input.
+    """
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+
+    def feed(self, data: bytes) -> bytes:
+        data = bytes(self._pending) + data
+        self._pending.clear()
+        hold = 0
+        if data.endswith(b"%"):
+            hold = 1
+        elif len(data) >= 2 and data[-2] == 0x25 and data[-1] in _HEX_BYTES:
+            hold = 2
+        if hold:
+            self._pending += data[-hold:]
+            data = data[:-hold]
+        return _unquote(data)
+
+    def finalize(self) -> bytes:
+        output = bytes(self._pending)
+        self._pending.clear()
+        return output
+
+
+_B64_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_B64_DISCARD = bytes(
+    byte for byte in range(256) if byte not in _B64_ALPHABET and byte != 0x3D
+)
+
+
+class _Base64Decoder:
+    """Incrementally decode base64 data with strict padding rules.
+
+    Characters outside the base64 alphabet are discarded, like
+    :func:`base64.b64decode` does by default, but padding is handled
+    strictly: padding is only allowed to complete the final 4-character
+    quantum, and any data after it, as well as a truncated final quantum,
+    raises :exc:`binascii.Error`.
+    """
+
+    def __init__(self) -> None:
+        self._quantum = bytearray()
+        self._done = False
+
+    def feed(self, data: bytes) -> bytes:
+        cleaned = data.translate(None, _B64_DISCARD)
+        if self._done:
+            if cleaned:
+                raise binascii.Error("Excess data after padding")
+            return b""
+        if not cleaned:
+            return b""
+        buf = bytes(self._quantum) + cleaned
+        self._quantum.clear()
+        padding_at = buf.find(b"=")
+        if padding_at < 0:
+            end = len(buf) // 4 * 4
+            self._quantum += buf[end:]
+            return binascii.a2b_base64(buf[:end]) if end else b""
+        size = padding_at % 4
+        if size < 2:
+            raise binascii.Error("Leading padding not allowed")
+        end = padding_at - size
+        output = binascii.a2b_base64(buf[:end]) if end else b""
+        tail = buf[end:]
+        if len(tail) < 4:
+            # Incomplete padded quantum, wait for more input.
+            self._quantum += tail
+            return output
+        quantum = tail[:4]
+        if quantum[size:] != b"=" * (4 - size):
+            raise binascii.Error("Discontinuous padding not allowed")
+        self._done = True
+        if len(tail) > 4:
+            raise binascii.Error("Excess data after padding")
+        return output + binascii.a2b_base64(quantum)
+
+    def finalize(self) -> bytes:
+        quantum = bytes(self._quantum)
+        self._quantum.clear()
+        if self._done or not quantum:
+            return b""
+        if len(quantum) == 1:
+            raise binascii.Error(
+                "Invalid base64-encoded string: number of data characters (1) "
+                "cannot be 1 more than a multiple of 4"
+            )
+        raise binascii.Error("Incorrect padding")
+
+
+def _write_all(sink: BinaryIO, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = sink.write(view)
+        if written is None:
+            # Some file-like objects report nothing; assume all bytes were
+            # accepted.
+            return
+        if written <= 0:
+            raise OSError("data sink accepted 0 bytes")
+        view = view[written:]
+
+
+class _DataURIMetadataParser:
+    """Find the comma that separates data URI metadata from the data.
+
+    Consumes the percent-decoded bytes that follow the ``data:`` scheme and
+    reports the first comma found outside of a quoted-string media type
+    parameter value, which is where the metadata ends and the data begins.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self._in_quote = False
+        self._escaped = False
+
+    def feed(self, data: bytes) -> int:
+        """Consume decoded metadata bytes.
+
+        Return the index right after the separating comma if it is found in
+        *data* (everything from that index on is data), or -1 otherwise.
+        """
+        for index, byte in enumerate(data):
+            if self._escaped:
+                self._escaped = False
+            elif self._in_quote:
+                if byte == 0x5C:  # "\\"
+                    self._escaped = True
+                elif byte == 0x22:  # '"'
+                    self._in_quote = False
+            elif byte == 0x22:  # '"'
+                self._in_quote = True
+            elif byte == 0x2C:  # ","
+                return index + 1
+            self.buffer.append(byte)
+        return -1
+
+
+def parse_data_uri_stream(
+    chunks: Iterable[str | bytes],
+    sink: BinaryIO,
+    *,
+    max_metadata_size: int = 1024,
+    max_data_size: int | None = None,
+) -> ParseDataURIStreamResult:
+    """Parse a data: URI received in chunks, writing the data into *sink*.
+
+    This is a streaming counterpart of :func:`parse_data_uri` that avoids
+    loading the whole URI and its decoded data into memory, which makes it
+    suitable for very large data URIs.
+
+    *chunks* is an iterable of URI fragments. ``str`` fragments are encoded
+    as UTF-8; unlike :func:`parse_data_uri`, no :func:`safe_url_string`
+    normalization is applied, as it cannot be reproduced chunk by chunk, so
+    control characters and leading or trailing whitespace are preserved
+    instead of being removed. To get the exact same output as
+    ``parse_data_uri(uri)`` for arbitrary input, pass
+    ``safe_url_string(uri).encode("ascii")`` (in chunks) instead of *uri*
+    itself. *sink* is a binary file-like object where the decoded data is
+    written through its ``write()`` method.
+
+    The metadata (the URI scheme, media type and media type parameters, i.e.
+    everything before the ``,`` that separates them from the data, keeping in
+    mind that quoted-string parameter values may contain commas) is first
+    read and validated in full, and only then is the data processed chunk by
+    chunk, decoding percent-encoded triplets and, if the metadata ends with
+    ``;base64``, base64 data. Percent-encoded triplets and base64 quanta
+    split across chunk boundaries are handled transparently. Unlike
+    :func:`parse_data_uri`, base64 padding is checked strictly: padding in
+    the middle of the data or after the final quantum, and truncated final
+    quanta, raise :exc:`binascii.Error` (a :exc:`ValueError` subclass).
+
+    *max_metadata_size* is the maximum number of bytes allowed for the scheme
+    and the percent-decoded metadata. *max_data_size* is the maximum number
+    of decoded data bytes to write into *sink*; ``None`` (default) means no
+    limit. Both limits are enforced on the actual (decoded) sizes, and
+    exceeding either raises :exc:`ValueError`.
+
+    On success a :class:`ParseDataURIStreamResult` is returned, with the
+    media type, its parameters and the number of bytes written into *sink*.
+
+    On failure (invalid or truncated input, exceeded limits, or an exception
+    raised by *sink*) an exception is raised and *sink* may already contain
+    part of the data; no attempt is made to roll back written bytes.
+    """
+    iterator = iter(chunks)
+
+    # Read the scheme, which is not percent-decoded.
+    scheme = bytearray()
+    colon_found = False
+    for chunk in iterator:
+        chunk = _normalize_data_uri_chunk(chunk)
+        colon_at = chunk.find(b":")
+        if colon_at >= 0:
+            scheme += chunk[:colon_at]
+            rest = chunk[colon_at + 1 :]
+            colon_found = True
+            break
+        scheme += chunk
+        if len(scheme) > max_metadata_size:
+            raise ValueError(
+                f"data URI metadata exceeds the maximum of {max_metadata_size} bytes"
+            )
+    else:
+        rest = b""
+
+    if not colon_found or not scheme:
+        raise ValueError("invalid URI")
+    if scheme.lower() != b"data":
+        raise ValueError("not a data URI")
+
+    # Read the metadata, percent-decoding on the fly, up to the separating
+    # comma.
+    metadata_parser = _DataURIMetadataParser()
+    percent_decoder = _PercentDecoder()
+    pending_data = b""
+    boundary_found = False
+
+    def post_scheme_chunks() -> Iterable[bytes]:
+        yield rest
+        for chunk in iterator:
+            yield _normalize_data_uri_chunk(chunk)
+
+    for chunk in post_scheme_chunks():
+        decoded = percent_decoder.feed(chunk)
+        data_at = metadata_parser.feed(decoded)
+        if len(scheme) + len(metadata_parser.buffer) > max_metadata_size:
+            raise ValueError(
+                f"data URI metadata exceeds the maximum of {max_metadata_size} bytes"
+            )
+        if data_at >= 0:
+            pending_data = decoded[data_at:]
+            boundary_found = True
+            break
+    if not boundary_found:
+        decoded = percent_decoder.finalize()
+        data_at = metadata_parser.feed(decoded)
+        if len(scheme) + len(metadata_parser.buffer) > max_metadata_size:
+            raise ValueError(
+                f"data URI metadata exceeds the maximum of {max_metadata_size} bytes"
+            )
+        if data_at >= 0:
+            pending_data = decoded[data_at:]
+            boundary_found = True
+
+    if not boundary_found and not metadata_parser.buffer:
+        raise ValueError("invalid URI")
+
+    metadata = bytes(metadata_parser.buffer)
+
+    media_type = "text/plain"
+    media_type_params: dict[str, str] = {}
+
+    m = _mediatype_pattern.match(metadata)
+    if m:
+        media_type = m.group().decode()
+        metadata = metadata[m.end() :]
+    else:
+        media_type_params["charset"] = "US-ASCII"
+
+    while m := _mediatype_parameter_pattern.match(metadata):
+        attribute, value, value_quoted = m.groups()
+        if value_quoted is not None:
+            value = re.sub(rb"\\(.)", rb"\1", value_quoted)
+        media_type_params[attribute.decode()] = value.decode()
+        metadata = metadata[m.end() :]
+
+    if metadata == b";base64":
+        is_base64 = True
+    elif metadata:
+        raise ValueError("invalid data URI")
+    else:
+        is_base64 = False
+
+    base64_decoder = _Base64Decoder() if is_base64 else None
+    bytes_written = 0
+
+    def emit(decoded: bytes) -> None:
+        nonlocal bytes_written
+        if not decoded:
+            return
+        if max_data_size is not None and bytes_written + len(decoded) > max_data_size:
+            raise ValueError(
+                f"data URI data exceeds the maximum of {max_data_size} bytes"
+            )
+        _write_all(sink, decoded)
+        bytes_written += len(decoded)
+
+    def process_decoded(decoded: bytes) -> None:
+        if base64_decoder is not None:
+            decoded = base64_decoder.feed(decoded)
+        emit(decoded)
+
+    process_decoded(pending_data)
+    for chunk in iterator:
+        process_decoded(percent_decoder.feed(_normalize_data_uri_chunk(chunk)))
+    process_decoded(percent_decoder.finalize())
+    if base64_decoder is not None:
+        emit(base64_decoder.finalize())
+
+    return ParseDataURIStreamResult(media_type, media_type_params, bytes_written)
+
+
+def _normalize_data_uri_chunk(chunk: str | bytes) -> bytes:
+    if isinstance(chunk, str):
+        return chunk.encode("utf-8")
+    if isinstance(chunk, (bytes, bytearray, memoryview)):
+        return bytes(chunk)
+    raise TypeError(
+        f"data URI chunks must be str or bytes-like, not {type(chunk).__name__}"
+    )
+
+
 __all__ = [
     "add_http_if_no_scheme",
     "add_or_replace_parameter",
@@ -636,6 +971,7 @@ __all__ = [
     "file_uri_to_path",
     "is_url",
     "parse_data_uri",
+    "parse_data_uri_stream",
     "path_to_file_uri",
     "safe_download_url",
     "safe_url_string",

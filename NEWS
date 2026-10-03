@@ -1,6 +1,16 @@
 w3lib release notes
 ===================
 
+2.6.0 (unreleased)
+------------------
+
+New features:
+
+- Added :func:`~w3lib.url.parse_data_uri_stream`, a streaming counterpart of
+  :func:`~w3lib.url.parse_data_uri` that parses a data: URI received in
+  chunks and writes the decoded data into a file-like object, with
+  configurable limits on the metadata size and on the decoded data size.
+
 2.5.0 (2026-09-30)
 ------------------
 

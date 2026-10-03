@@ -29,3 +29,6 @@ w3lib Package
 
     .. autoclass:: ParseDataURIResult
        :members:
+
+    .. autoclass:: ParseDataURIStreamResult
+       :members:

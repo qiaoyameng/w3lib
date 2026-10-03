@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import os
 import sys
 from inspect import isclass
@@ -51,6 +53,7 @@ from w3lib.url import (
     file_uri_to_path,
     is_url,
     parse_data_uri,
+    parse_data_uri_stream,
     parse_qsl_to_bytes,
     parse_url,
     path_to_file_uri,
@@ -2275,6 +2278,320 @@ class TestDataURI:
         assert result.data == b"A brief note"
         result = parse_data_uri("DaTa:,A%20brief%20note")
         assert result.data == b"A brief note"
+
+
+class TestDataURIStream:
+    URIS = [
+        "data:,A%20brief%20note",
+        "data:,",
+        "data:,é",
+        "data:;charset=iso-8859-7,%be%d3%be",
+        "data:text/plain;charset=iso-8859-7,%be%d3%be",
+        "data:text/plain;foo=%22foo;bar%5C%22%22;charset=utf-8;"
+        "bar=%22foo;%5C%22foo%20;/%20,%22,%CE%8E%CE%A3%CE%8E",
+        'data:text/plain;foo="",AAA',
+        "data:text/plain;base64,SGVsbG8sIHdvcmxkLg%3D%3D",
+        "data:text/plain;base64,SGVsb%20G8sIH%0A%20%20dvcm%20%20%20xk%20Lg%3D%0A%3D",
+        "data:text/plain;base64,SGVsb G8sIH\n  dvcm   xk Lg%3D\n%3D",
+        "data:text/plain",
+        "data:text/plain;base64",
+        "DATA:,A%20brief%20note",
+        "data:,%",
+        "data:,%2",
+        "data:,100%",
+        "data:,%41%42%43",
+    ]
+
+    @staticmethod
+    def chunk(uri, size):
+        return [uri[i : i + size] for i in range(0, len(uri), size)]
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 3, 4, 5, 7, 64])
+    def test_consistent_with_parse_data_uri(self, chunk_size):
+        for uri in self.URIS:
+            expected = parse_data_uri(uri)
+            sink = io.BytesIO()
+            result = parse_data_uri_stream(self.chunk(uri, chunk_size), sink)
+            assert result.media_type == expected.media_type
+            assert result.media_type_parameters == expected.media_type_parameters
+            assert sink.getvalue() == expected.data
+            assert result.bytes_written == len(expected.data)
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 64])
+    def test_consistent_with_parse_data_uri_bytes(self, chunk_size):
+        for uri in self.URIS:
+            uri_bytes = safe_url_string(uri).encode("ascii")
+            expected = parse_data_uri(uri_bytes)
+            sink = io.BytesIO()
+            result = parse_data_uri_stream(self.chunk(uri_bytes, chunk_size), sink)
+            assert result.media_type == expected.media_type
+            assert result.media_type_parameters == expected.media_type_parameters
+            assert sink.getvalue() == expected.data
+            assert result.bytes_written == len(expected.data)
+
+    def test_empty_chunks(self):
+        sink = io.BytesIO()
+        result = parse_data_uri_stream(
+            ["", "data:,", b"", "A%20", "", "brief%20note", ""], sink
+        )
+        assert result.bytes_written == 12
+        assert sink.getvalue() == b"A brief note"
+
+    def test_split_percent_triplet(self):
+        sink = io.BytesIO()
+        result = parse_data_uri_stream(["data:,A%2", "0b"], sink)
+        assert sink.getvalue() == b"A b"
+        assert result.bytes_written == 3
+
+    def test_split_base64_padding(self):
+        sink = io.BytesIO()
+        result = parse_data_uri_stream(
+            ["data:text/plain;base64,SGVsbG8sIHdvcmxkLg%", "3", "D%3D"], sink
+        )
+        assert sink.getvalue() == b"Hello, world."
+        assert result.bytes_written == 13
+
+    def test_max_metadata_size(self):
+        sink = io.BytesIO()
+        result = parse_data_uri_stream(
+            ["data:text/plain,AAA"], sink, max_metadata_size=14
+        )
+        assert result.media_type == "text/plain"
+        assert sink.getvalue() == b"AAA"
+        with pytest.raises(ValueError, match="metadata exceeds the maximum"):
+            parse_data_uri_stream(
+                ["data:text/plain,AAA"], io.BytesIO(), max_metadata_size=13
+            )
+
+    def test_max_metadata_size_spanning_chunks(self):
+        chunks = ["data:text/", "plain;", "charset=utf-8", ",AAA"]
+        with pytest.raises(ValueError, match="metadata exceeds the maximum"):
+            parse_data_uri_stream(chunks, io.BytesIO(), max_metadata_size=10)
+
+    def test_max_data_size(self):
+        sink = io.BytesIO()
+        result = parse_data_uri_stream(
+            ["data:,AAAA"], sink, max_data_size=4
+        )
+        assert result.bytes_written == 4
+        with pytest.raises(ValueError, match="data exceeds the maximum"):
+            parse_data_uri_stream(["data:,AAAAA"], io.BytesIO(), max_data_size=4)
+
+    def test_max_data_size_counts_decoded_bytes(self):
+        # 300 encoded bytes decode to 100 bytes; the limit applies to the
+        # decoded size, not to the encoded length.
+        uri = "data:," + "%41" * 100
+        sink = io.BytesIO()
+        result = parse_data_uri_stream([uri], sink, max_data_size=100)
+        assert result.bytes_written == 100
+        assert sink.getvalue() == b"A" * 100
+        with pytest.raises(ValueError, match="data exceeds the maximum"):
+            parse_data_uri_stream([uri], io.BytesIO(), max_data_size=99)
+
+    def test_max_data_size_base64(self):
+        uri = "data:;base64," + "QUJD" * 25  # 75 decoded bytes
+        sink = io.BytesIO()
+        result = parse_data_uri_stream([uri], sink, max_data_size=75)
+        assert result.bytes_written == 75
+        with pytest.raises(ValueError, match="data exceeds the maximum"):
+            parse_data_uri_stream([uri], io.BytesIO(), max_data_size=74)
+
+    def test_max_data_size_partial_write(self):
+        # On failure the sink may already contain some of the data; there is
+        # no atomic rollback.
+        sink = io.BytesIO()
+        with pytest.raises(ValueError, match="data exceeds the maximum"):
+            parse_data_uri_stream(["data:,AAAAAAAA"], sink, max_data_size=4)
+        assert len(sink.getvalue()) <= 4
+
+    def test_truncated_base64(self):
+        with pytest.raises(ValueError, match="[Ii]ncorrect padding"):
+            parse_data_uri_stream(["data:;base64,SGV"], io.BytesIO())
+        with pytest.raises(ValueError, match="[Ii]ncorrect padding"):
+            parse_data_uri_stream(["data:;base64,SG="], io.BytesIO())
+        with pytest.raises(ValueError, match="number of data characters"):
+            parse_data_uri_stream(["data:;base64,S"], io.BytesIO())
+
+    def test_middle_padding_not_swallowed(self):
+        # parse_data_uri is lenient here, the streaming parser must not be.
+        assert parse_data_uri("data:;base64,SGV=sbG8").data == b"He"
+        with pytest.raises(ValueError, match="[Ee]xcess data after padding"):
+            parse_data_uri_stream(["data:;base64,SGV=sbG8"], io.BytesIO())
+        with pytest.raises(ValueError, match="[Dd]iscontinuous padding"):
+            parse_data_uri_stream(["data:;base64,SG=b8"], io.BytesIO())
+
+    def test_data_after_padding_not_swallowed(self):
+        with pytest.raises(ValueError, match="[Ee]xcess data after padding"):
+            parse_data_uri_stream(["data:;base64,SGVsbG8==SG8="], io.BytesIO())
+        with pytest.raises(ValueError, match="[Ee]xcess data after padding"):
+            parse_data_uri_stream(["data:;base64,SGVsbG8==="], io.BytesIO())
+
+    def test_leading_padding_not_swallowed(self):
+        with pytest.raises(ValueError, match="[Ll]eading padding"):
+            parse_data_uri_stream(["data:;base64,===="], io.BytesIO())
+
+    def test_padding_split_across_chunks(self):
+        with pytest.raises(ValueError, match="[Ee]xcess data after padding"):
+            parse_data_uri_stream(
+                ["data:;base64,SGVsbG8", "=", "=", "SG8="], io.BytesIO()
+            )
+
+    def test_truncated_input(self):
+        with pytest.raises(ValueError, match="invalid data URI"):
+            parse_data_uri_stream(["data:A%20brief%20note"], io.BytesIO())
+        with pytest.raises(ValueError, match="invalid URI"):
+            parse_data_uri_stream(["data:"], io.BytesIO())
+        with pytest.raises(ValueError, match="invalid URI"):
+            parse_data_uri_stream([], io.BytesIO())
+        with pytest.raises(ValueError, match="invalid URI"):
+            parse_data_uri_stream(["text/plain,A%20brief%20note"], io.BytesIO())
+        with pytest.raises(ValueError, match="not a data URI"):
+            parse_data_uri_stream(["http://example.com/"], io.BytesIO())
+        with pytest.raises(ValueError, match="invalid data URI"):
+            parse_data_uri_stream(
+                ["data:text/plain;baes64,SGVsbG8="], io.BytesIO()
+            )
+
+    def test_sink_write_failure(self):
+        class FailingSink:
+            def __init__(self):
+                self.data = bytearray()
+
+            def write(self, data):
+                self.data += bytes(data[:2])
+                raise OSError("disk full")
+
+        sink = FailingSink()
+        with pytest.raises(OSError, match="disk full"):
+            parse_data_uri_stream(["data:,AAAAAAAA"], sink)
+        # The sink may already hold some bytes; there is no rollback.
+        assert sink.data == b"AA"
+
+    def test_sink_partial_writes(self):
+        class PartialSink:
+            def __init__(self):
+                self.data = bytearray()
+
+            def write(self, data):
+                data = bytes(data)
+                self.data += data[:3]
+                return 3
+
+        sink = PartialSink()
+        result = parse_data_uri_stream(["data:,AAAAAAAA"], sink)
+        assert result.bytes_written == 8
+        assert sink.data == b"AAAAAAAA"
+
+    def test_metadata_validated_before_writing(self):
+        sink = io.BytesIO()
+        with pytest.raises(ValueError, match="invalid data URI"):
+            parse_data_uri_stream(
+                ["data:text/plain;baes64,", "AAAAAAAA"], sink
+            )
+        assert sink.getvalue() == b""
+
+
+class TestDataURIStreamProperties:
+    @staticmethod
+    @st.composite
+    def valid_data_uris(draw):
+        token = st.text(
+            st.sampled_from("abcdefghij0123456789+-._"), min_size=1, max_size=8
+        )
+        parts = ["data:"]
+        if draw(st.booleans()):
+            parts.append(f"{draw(token)}/{draw(token)}")
+        for _ in range(draw(st.integers(min_value=0, max_value=3))):
+            if draw(st.booleans()):
+                value = draw(token)
+            else:
+                # A quoted-string value, possibly with commas and escapes.
+                inner = draw(st.text(st.sampled_from("ab ,;\""), max_size=6))
+                value = '"{}"'.format(inner.replace('"', '\\"'))
+            parts.append(f";{draw(token)}={value}")
+        is_base64 = draw(st.booleans())
+        if is_base64:
+            parts.append(";base64")
+        parts.append(",")
+        raw = draw(st.binary(max_size=20))
+        if is_base64:
+            encoded = base64.b64encode(raw).decode()
+            data = "".join(
+                char if char != "=" or draw(st.booleans()) else "%3D"
+                for char in encoded
+            )
+        else:
+            data = "".join(
+                chr(byte)
+                if chr(byte) in "abcXYZ019-._" and draw(st.booleans())
+                else f"%{byte:02X}"
+                for byte in raw
+            )
+        parts.append(data)
+        return "".join(parts)
+
+    @staticmethod
+    def chunk(uri, sizes):
+        chunks = []
+        pos = 0
+        for size in sizes:
+            if pos >= len(uri):
+                break
+            chunks.append(uri[pos : pos + size])
+            pos += size
+        chunks.append(uri[pos:])
+        return chunks
+
+    @example(
+        body='text/plain;foo="a,b";base64,SGVsbG8=',
+        chunk_sizes=[1] * 100,
+    )
+    @example(body=";base64,SGVsbG8=", chunk_sizes=[3, 1, 2, 5, 4])
+    @settings(max_examples=300)
+    @given(
+        st.text(
+            st.sampled_from(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                "%;,=\":/\\+-_. \n"
+            ),
+            max_size=40,
+        ),
+        st.lists(st.integers(min_value=1, max_value=5), max_size=60),
+    )
+    def test_consistent_with_parse_data_uri(self, body, chunk_sizes):
+        uri = safe_url_string("data:" + body).encode("ascii")
+        chunks = self.chunk(uri, chunk_sizes)
+        sink = io.BytesIO()
+        try:
+            expected = parse_data_uri(uri)
+        except ValueError:
+            with pytest.raises(ValueError):
+                parse_data_uri_stream(chunks, sink)
+            return
+        try:
+            result = parse_data_uri_stream(chunks, sink)
+        except ValueError as exc:
+            # The streaming parser is stricter about base64 padding.
+            assert "padding" in str(exc)
+            return
+        assert result.media_type == expected.media_type
+        assert result.media_type_parameters == expected.media_type_parameters
+        assert sink.getvalue() == expected.data
+        assert result.bytes_written == len(expected.data)
+
+    @settings(max_examples=300)
+    @given(
+        valid_data_uris(),
+        st.lists(st.integers(min_value=1, max_value=4), max_size=100),
+    )
+    def test_valid_uris_match_parse_data_uri(self, uri, chunk_sizes):
+        expected = parse_data_uri(uri)
+        sink = io.BytesIO()
+        result = parse_data_uri_stream(self.chunk(uri, chunk_sizes), sink)
+        assert result.media_type == expected.media_type
+        assert result.media_type_parameters == expected.media_type_parameters
+        assert sink.getvalue() == expected.data
+        assert result.bytes_written == len(expected.data)
 
 
 class TestParseQsl:
