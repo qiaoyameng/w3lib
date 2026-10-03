@@ -1,6 +1,16 @@
 w3lib release notes
 ===================
 
+2.6.0 (unreleased)
+------------------
+
+New features:
+
+- Added the offline :mod:`w3lib.psl` module. :class:`~w3lib.psl.PublicSuffixList`
+  builds its index from Public Suffix List text supplied by the caller, with no
+  network access, and reports normal, wildcard and exception rules as well as
+  optional private-domain sections.
+
 2.5.0 (2026-09-30)
 ------------------
 

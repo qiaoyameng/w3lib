@@ -21,6 +21,12 @@ w3lib Package
 .. automodule:: w3lib.http
     :members:
 
+:mod:`~w3lib.psl` Module
+------------------------
+
+.. automodule:: w3lib.psl
+    :members:
+
 :mod:`~w3lib.url` Module
 ------------------------
 
