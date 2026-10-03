@@ -21,6 +21,21 @@ w3lib Package
 .. automodule:: w3lib.http
     :members:
 
+    .. autoclass:: ParsedContentDisposition
+       :members:
+
+    .. autoclass:: ExtendedParameter
+       :members:
+
+    .. autoclass:: ContentDispositionIssueInfo
+       :members:
+
+    .. autoclass:: FilenameSource
+       :members:
+
+    .. autoclass:: ContentDispositionIssue
+       :members:
+
 :mod:`~w3lib.url` Module
 ------------------------
 

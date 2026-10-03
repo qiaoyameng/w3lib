@@ -1,6 +1,21 @@
 w3lib release notes
 ===================
 
+Unreleased
+----------
+
+New features:
+
+- Added :func:`~w3lib.http.parse_content_disposition`, a structured parser
+  for ``Content-Disposition`` header values. It returns the disposition type,
+  plain parameters, extended ``name*`` parameters (RFC 8187, including the
+  charset and language segments), the selected filename (``filename*`` takes
+  precedence over ``filename``) and a filesystem-safe version from
+  :func:`~w3lib.http.safe_filename`. Duplicate parameters, malformed
+  percent-encoding and unknown charsets follow a deterministic policy, and
+  every fallback is reported in an ``issues`` list instead of being silently
+  guessed.
+
 2.5.0 (2026-09-30)
 ------------------
 
