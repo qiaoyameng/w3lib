@@ -11,6 +11,7 @@ import w3lib.encoding
 from w3lib.encoding import (
     html_body_declared_encoding,
     html_encoding,
+    html_encoding_report,
     html_to_unicode,
     http_content_type_encoding,
     read_bom,
@@ -624,3 +625,179 @@ class TestHtmlConversion:
     def test_empty_body(self):
         # if no other method available, the default encoding of utf-8 is used
         self._assert_encoding_detected(None, "utf-8", b"")
+
+
+class TestEncodingDecisionReport:
+    @staticmethod
+    def _assert_consistent(
+        content_type: str | None,
+        body: bytes,
+        expected_encoding: str,
+        expected_text: str,
+    ) -> Any:
+        encoding, text, report = html_to_unicode(content_type, body, report=True)
+        assert encoding == expected_encoding
+        assert text == expected_text
+        assert report.encoding == encoding
+        assert report.adopted.encoding == encoding
+        assert sum(c.status == "adopted" for c in report.candidates) == 1
+        assert html_encoding(content_type, body, report=True) == (encoding, report)
+        assert html_encoding_report(content_type, body) == report
+
+        for candidate in report.declarations:
+            assert candidate.start is not None
+            assert candidate.end is not None
+            assert 0 <= candidate.start <= candidate.end <= len(body)
+            raw = body[candidate.start : candidate.end]
+            assert b"meta" in raw[:8].lower() or raw.startswith(b"<?xml")
+            if candidate.status == "ignored":
+                assert candidate.reason.startswith(("ignored:", "not consulted:"))
+        return report
+
+    def test_bom_wins_over_http_charset(self):
+        body = codecs.BOM_UTF8 + '<meta charset="windows-1251">Привет'.encode()
+        report = self._assert_consistent(
+            ct("windows-1251"),
+            body,
+            "utf-8",
+            '<meta charset="windows-1251">Привет',
+        )
+
+        assert report.adopted.source == "bom"
+        assert (report.bom.start, report.bom.end) == (0, len(codecs.BOM_UTF8))
+        assert report.http_charset.encoding == "cp1251"
+        assert report.http_charset.status == "ignored"
+        assert "BOM" in report.http_charset.reason
+        assert any(
+            declaration.source == "meta"
+            and declaration.encoding == "cp1251"
+            and declaration.status == "ignored"
+            and "BOM" in declaration.reason
+            for declaration in report.declarations
+        )
+
+    def test_invalid_tag_shapes_are_not_evidence(self):
+        body = (
+            b'< meta charset="big5">'
+            b"<meta charset=big5/>"
+            b'<meta charset="utf-8">ok'
+        )
+        report = self._assert_consistent(None, body, "utf-8", body.decode("utf-8"))
+
+        assert report.adopted.source == "meta"
+        assert (report.adopted.start, report.adopted.end) == (42, 64)
+        assert report.declarations[0].reason.startswith(
+            "ignored: whitespace between"
+        )
+        assert report.declarations[1].reason.startswith(
+            "ignored: charset label 'big5/'"
+        )
+        assert report.declarations[2].status == "adopted"
+
+    def test_pseudo_meta_in_comment_and_script_is_ignored(self):
+        body = (
+            b'<!-- <meta charset="big5"> -->'
+            b'<script><meta charset="windows-1251"></script>'
+            b'<meta charset="utf-8">ok'
+        )
+        report = self._assert_consistent(None, body, "utf-8", body.decode("utf-8"))
+
+        assert [declaration.valid for declaration in report.declarations] == [
+            False,
+            False,
+            True,
+        ]
+        assert "HTML comment" in report.declarations[0].reason
+        assert "<script>" in report.declarations[1].reason
+        assert report.declarations[2].status == "adopted"
+
+    def test_truncated_declaration_is_marked_and_used(self):
+        body = b'<meta charset="windows-1251"' + "Привет".encode("cp1251")
+        report = self._assert_consistent(
+            None,
+            body,
+            "cp1251",
+            '<meta charset="windows-1251"Привет',
+        )
+
+        assert report.adopted.source == "meta"
+        assert report.adopted.truncated is True
+        assert report.adopted.start == 0
+        assert report.adopted.end == len(body)
+        assert "truncated" in report.adopted.reason
+
+    def test_meta_after_body_window_is_ignored(self):
+        body = (
+            b"<head></head><body>"
+            + b"x" * 1100
+            + b'<meta charset="windows-1251">ok'
+        )
+        report = self._assert_consistent(None, body, "utf-8", body.decode("utf-8"))
+
+        assert report.adopted.source == "fallback"
+        assert report.adopted.details_available is False
+        assert "confidence" in report.adopted.reason
+        assert len(report.declarations) == 1
+        late = report.declarations[0]
+        assert late.encoding == "cp1251"
+        assert late.status == "ignored"
+        assert late.start == body.index(b"<meta")
+        assert "1024-byte window" in late.reason
+
+    def test_probe_callback_runs_at_most_once(self):
+        calls = []
+
+        def probe(body: bytes) -> str:
+            calls.append(body)
+            return "cp1251"
+
+        body = b"no declaration here"
+        with pytest.warns(DeprecationWarning, match="auto_detect_fun"):
+            encoding, text, report = html_to_unicode(
+                None, body, auto_detect_fun=probe, report=True
+            )
+
+        assert calls == [body]
+        assert encoding == "cp1251"
+        assert text == body.decode("cp1251")
+        assert report.adopted.source == "probe-callback"
+        assert report.adopted.encoding == encoding
+
+    def test_report_path_does_not_call_detector_twice(self, monkeypatch):
+        calls = {"declared": 0, "autodetect": 0}
+        real_declared = w3lib.encoding.declared_encoding
+        real_autodetect = w3lib.encoding.autodetect_encoding
+
+        def declared(body: bytes):
+            calls["declared"] += 1
+            return real_declared(body)
+
+        def autodetect(body: bytes, *, url=None):
+            calls["autodetect"] += 1
+            return real_autodetect(body, url=url)
+
+        monkeypatch.setattr(w3lib.encoding, "declared_encoding", declared)
+        monkeypatch.setattr(w3lib.encoding, "autodetect_encoding", autodetect)
+        monkeypatch.setattr(
+            w3lib.encoding,
+            "detect_encoding",
+            lambda *args, **kwargs: pytest.fail("detect_encoding called again"),
+        )
+
+        encoding, text, report = html_to_unicode(
+            None, b"no declaration here", report=True
+        )
+
+        assert encoding == "utf-8"
+        assert text == "no declaration here"
+        assert report.adopted.source == "fallback"
+        assert calls == {"declared": 1, "autodetect": 1}
+
+    def test_report_off_does_not_run_report_scanner(self, monkeypatch):
+        def fail(*args, **kwargs):
+            pytest.fail("report scanner ran without a report")
+
+        monkeypatch.setattr(w3lib.encoding, "_scan_declarations", fail)
+        body = b'<meta charset="utf-8">ok'
+        assert html_to_unicode(None, body) == ("utf-8", body.decode())
+        assert html_encoding(None, body) == "utf-8"

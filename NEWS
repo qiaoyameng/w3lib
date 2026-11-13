@@ -1,6 +1,18 @@
 w3lib release notes
 ===================
 
+2.7.0 (unreleased)
+------------------
+
+New features:
+
+- :func:`~w3lib.encoding.html_to_unicode` and
+  :func:`~w3lib.encoding.html_encoding` accept ``report=True``, returning an
+  :class:`~w3lib.encoding.EncodingDecisionReport` that lists the BOM, HTTP
+  charset, meta/XML declarations with byte ranges, and fallback detection,
+  marking which candidate was adopted and why the others were ignored.
+  :func:`~w3lib.encoding.html_encoding_report` returns the report alone.
+
 2.6.0 (2026-11-05)
 ------------------
 
